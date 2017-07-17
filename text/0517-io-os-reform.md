@@ -62,13 +62,17 @@ follow-up PRs against this RFC.
             * [Errors]
             * [Channel adapters]
             * [stdin, stdout, stderr]
+            * [Printing functions]
         * [std::env]
         * [std::fs]
             * [Free functions]
             * [Files]
             * [File kinds]
             * [File permissions]
-        * [std::net] (stub)
+        * [std::net]
+            * [TCP]
+            * [UDP]
+            * [Addresses]
         * [std::process]
             * [Command]
             * [Child]
@@ -1012,10 +1016,11 @@ strings) and is usually what you want when working with iterators.
 
 The `BufReader`, `BufWriter` and `BufStream` types stay
 essentially as they are today, except that for streams and writers the
-`into_inner` method yields the structure back in the case of a flush error:
-
+`into_inner` method yields the structure back in the case of a write error,
+and its behavior is clarified to writing out the buffered data without
+flushing the underlying reader:
 ```rust
-// If flushing fails, you get the unflushed data back
+// If writing fails, you get the unwritten data back
 fn into_inner(self) -> Result<W, IntoInnerError<Self>>;
 
 pub struct IntoInnerError<W>(W, Error);
@@ -1151,7 +1156,176 @@ RFC recommends they remain unstable.
 #### `stdin`, `stdout`, `stderr`
 [stdin, stdout, stderr]: #stdin-stdout-stderr
 
-> To be added in a follow-up PR.
+The current `stdio` module will be removed in favor of these constructors in the
+`io` module:
+
+```rust
+pub fn stdin() -> Stdin;
+pub fn stdout() -> Stdout;
+pub fn stderr() -> Stderr;
+```
+
+* `stdin` - returns a handle to a **globally shared** standard input of
+  the process which is buffered as well. Due to the globally shared nature of
+  this handle, all operations on `Stdin` directly will acquire a lock internally
+  to ensure access to the shared buffer is synchronized. This implementation
+  detail is also exposed through a `lock` method where the handle can be
+  explicitly locked for a period of time so relocking is not necessary.
+
+  The `Read` trait will be implemented directly on the returned `Stdin` handle
+  but the `BufRead` trait will not be (due to synchronization concerns). The
+  locked version of `Stdin` (`StdinLock`) will provide an implementation of
+  `BufRead`.
+
+  The design will largely be the same as is today with the `old_io` module.
+
+  ```rust
+  impl Stdin {
+      fn lock(&self) -> StdinLock;
+      fn read_line(&mut self, into: &mut String) -> io::Result<()>;
+      fn read_until(&mut self, byte: u8, into: &mut Vec<u8>) -> io::Result<()>;
+  }
+  impl Read for Stdin { ... }
+  impl Read for StdinLock { ... }
+  impl BufRead for StdinLock { ... }
+  ```
+
+* `stderr` - returns a **non buffered** handle to the standard error output
+  stream for the process. Each call to `write` will roughly translate to a
+  system call to output data when written to `stderr`. This handle is locked
+  like `stdin` to ensure, for example, that calls to `write_all` are atomic with
+  respect to one another. There will also be an RAII guard to lock the handle
+  and use the result as an instance of `Write`.
+
+  ```rust
+  impl Stderr {
+      fn lock(&self) -> StderrLock;
+  }
+  impl Write for Stderr { ... }
+  impl Write for StderrLock { ... }
+  ```
+
+* `stdout` - returns a **globally buffered** handle to the standard output of
+  the current process. The amount of buffering can be decided at runtime to
+  allow for different situations such as being attached to a TTY or being
+  redirected to an output file. The `Write` trait will be implemented for this
+  handle, and like `stderr` it will be possible to lock it and then use the
+  result as an instance of `Write` as well.
+
+  ```rust
+  impl Stdout {
+      fn lock(&self) -> StdoutLock;
+  }
+  impl Write for Stdout { ... }
+  impl Write for StdoutLock { ... }
+  ```
+
+#### Windows and stdio
+[Windows stdio]: #windows-and-stdio
+
+On Windows, standard input and output handles can work with either arbitrary
+`[u8]` or `[u16]` depending on the state at runtime. For example a program
+attached to the console will work with arbitrary `[u16]`, but a program attached
+to a pipe would work with arbitrary `[u8]`.
+
+To handle this difference, the following behavior will be enforced for the
+standard primitives listed above:
+
+* If attached to a pipe then no attempts at encoding or decoding will be done,
+  the data will be ferried through as `[u8]`.
+
+* If attached to a console, then `stdin` will attempt to interpret all input as
+  UTF-16, re-encoding into UTF-8 and returning the UTF-8 data instead. This
+  implies that data will be buffered internally to handle partial reads/writes.
+  Invalid UTF-16 will simply be discarded returning an `io::Error` explaining
+  why.
+
+* If attached to a console, then `stdout` and `stderr` will attempt to interpret
+  input as UTF-8, re-encoding to UTF-16. If the input is not valid UTF-8 then an
+  error will be returned and no data will be written.
+
+#### Raw stdio
+[Raw stdio]: #raw-stdio
+
+> **Note**: This section is intended to be a sketch of possible raw stdio
+>           support, but it is not planned to implement or stabilize this
+>           implementation at this time.
+
+The above standard input/output handles all involve some form of locking or
+buffering (or both). This cost is not always wanted, and hence raw variants will
+be provided. Due to platform differences across unix/windows, the following
+structure will be supported:
+
+```rust
+mod os {
+    mod unix {
+        mod stdio {
+            struct Stdio { .. }
+
+            impl Stdio {
+                fn stdout() -> Stdio;
+                fn stderr() -> Stdio;
+                fn stdin() -> Stdio;
+            }
+
+            impl Read for Stdio { ... }
+            impl Write for Stdio { ... }
+        }
+    }
+
+    mod windows {
+        mod stdio {
+            struct Stdio { ... }
+            struct StdioConsole { ... }
+
+            impl Stdio {
+                fn stdout() -> io::Result<Stdio>;
+                fn stderr() -> io::Result<Stdio>;
+                fn stdin() -> io::Result<Stdio>;
+            }
+            // same constructors StdioConsole
+
+            impl Read for Stdio { ... }
+            impl Write for Stdio { ... }
+
+            impl StdioConsole {
+                // returns slice of what was read
+                fn read<'a>(&self, buf: &'a mut OsString) -> io::Result<&'a OsStr>;
+                // returns remaining part of `buf` to be written
+                fn write<'a>(&self, buf: &'a OsStr) -> io::Result<&'a OsStr>;
+            }
+        }
+    }
+}
+```
+
+There are some key differences from today's API:
+
+* On unix, the API has not changed much except that the handles have been
+  consolidated into one type which implements both `Read` and `Write` (although
+  writing to stdin is likely to generate an error).
+* On windows, there are two sets of handles representing the difference between
+  "console mode" and not (e.g. a pipe). When not a console the normal I/O traits
+  are implemented (delegating to `ReadFile` and `WriteFile`. The console mode
+  operations work with `OsStr`, however, to show how they work with UCS-2 under
+  the hood.
+
+#### Printing functions
+[Printing functions]: #printing-functions
+
+The current `print`, `println`, `print_args`, and `println_args` functions will
+all be "removed from the public interface" by [prefixing them with `__` and
+marking `#[doc(hidden)]`][gh22607]. These are all implementation details of the
+`print!` and `println!` macros and don't need to be exposed in the public
+interface.
+
+[gh22607]: https://github.com/rust-lang/rust/issues/22607
+
+The `set_stdout` and `set_stderr` functions will be removed with no replacement
+for now. It's unclear whether these functions should indeed control a thread
+local handle instead of a global handle as whether they're justified in the
+first place. It is a backwards-compatible extension to allow this sort of output
+to be redirected and can be considered if the need arises.
 
 ### `std::env`
 [std::env]: #stdenv
@@ -1169,7 +1343,8 @@ and the signatures will be updated to follow this RFC's
 
 * `vars` (renamed from `env`): yields a vector of `(OsString, OsString)` pairs.
 * `var` (renamed from `getenv`): take a value bounded by `AsOsStr`,
-  allowing Rust strings and slices to be ergonomically passed in. Yields an `Option<OsString>`.
+  allowing Rust strings and slices to be ergonomically passed in. Yields an
+  `Option<OsString>`.
 * `var_string`: take a value bounded by `AsOsStr`, returning `Result<String,
   VarError>` where `VarError` represents a non-unicode `OsString` or a "not
   present" value.
@@ -1361,7 +1536,223 @@ This trait will essentially remain stay as it is (renamed from
 ### `std::net`
 [std::net]: #stdnet
 
-> To be added in a follow-up PR.
+The contents of `std::io::net` submodules `tcp`, `udp`, `ip` and
+`addrinfo` will be retained but moved into a single `std::net` module;
+the other modules are being moved or removed and are described
+elsewhere.
+
+#### SocketAddr
+
+This structure will represent either a `sockaddr_in` or `sockaddr_in6` which is
+commonly just a pairing of an IP address and a port.
+
+```rust
+enum SocketAddr {
+    V4(SocketAddrV4),
+    V6(SocketAddrV6),
+}
+
+impl SocketAddrV4 {
+    fn new(addr: Ipv4Addr, port: u16) -> SocketAddrV4;
+    fn ip(&self) -> &Ipv4Addr;
+    fn port(&self) -> u16;
+}
+
+impl SocketAddrV6 {
+    fn new(addr: Ipv6Addr, port: u16, flowinfo: u32, scope_id: u32) -> SocketAddrV6;
+    fn ip(&self) -> &Ipv6Addr;
+    fn port(&self) -> u16;
+    fn flowinfo(&self) -> u32;
+    fn scope_id(&self) -> u32;
+}
+```
+
+#### Ipv4Addr
+
+Represents a version 4 IP address. It has the following interface:
+
+```rust
+impl Ipv4Addr {
+    fn new(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr;
+    fn any() -> Ipv4Addr;
+    fn octets(&self) -> [u8; 4];
+    fn to_ipv6_compatible(&self) -> Ipv6Addr;
+    fn to_ipv6_mapped(&self) -> Ipv6Addr;
+}
+```
+
+#### Ipv6Addr
+
+Represents a version 6 IP address. It has the following interface:
+
+```rust
+impl Ipv6Addr {
+    fn new(a: u16, b: u16, c: u16, d: u16, e: u16, f: u16, g: u16, h: u16) -> Ipv6Addr;
+    fn any() -> Ipv6Addr;
+    fn segments(&self) -> [u16; 8]
+    fn to_ipv4(&self) -> Option<Ipv4Addr>;
+}
+```
+
+#### TCP
+[TCP]: #tcp
+
+The current `TcpStream` struct will be pared back from where it is today to the
+following interface:
+
+```rust
+// TcpStream, which contains both a reader and a writer
+
+impl TcpStream {
+    fn connect<A: ToSocketAddrs>(addr: &A) -> io::Result<TcpStream>;
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+    fn try_clone(&self) -> io::Result<TcpStream>;
+}
+
+impl Read for TcpStream { ... }
+impl Write for TcpStream { ... }
+impl<'a> Read for &'a TcpStream { ... }
+impl<'a> Write for &'a TcpStream { ... }
+#[cfg(unix)]    impl AsRawFd for TcpStream { ... }
+#[cfg(windows)] impl AsRawSocket for TcpStream { ... }
+```
+
+* `clone` has been replaced with a `try_clone` function. The implementation of
+  `try_clone` will map to using `dup` on Unix platforms and
+  `WSADuplicateSocket` on Windows platforms. The `TcpStream` itself will no
+   longer be reference counted itself under the hood.
+* `close_{read,write}` are both removed in favor of binding the `shutdown`
+  function directly on sockets. This will map to the `shutdown` function on both
+  Unix and Windows.
+* `set_timeout` has been removed for now (as well as other timeout-related
+  functions). It is likely that this may come back soon as a binding to
+  `setsockopt` to the `SO_RCVTIMEO` and `SO_SNDTIMEO` options. This RFC does not
+  currently proposed adding them just yet, however.
+* Implementations of `Read` and `Write` are provided for `&TcpStream`. These
+  implementations are not necessarily ergonomic to call (requires taking an
+  explicit reference), but they express the ability to concurrently read and
+  write from a `TcpStream`
+
+Various other options such as `nodelay` and `keepalive` will be left
+`#[unstable]` for now. The `TcpStream` structure will also adhere to both `Send`
+and `Sync`.
+
+The `TcpAcceptor` struct will be removed and all functionality will be folded
+into the `TcpListener` structure. Specifically, this will be the resulting API:
+
+```rust
+impl TcpListener {
+    fn bind<A: ToSocketAddrs>(addr: &A) -> io::Result<TcpListener>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn try_clone(&self) -> io::Result<TcpListener>;
+    fn accept(&self) -> io::Result<(TcpStream, SocketAddr)>;
+    fn incoming(&self) -> Incoming;
+}
+
+impl<'a> Iterator for Incoming<'a> {
+    type Item = io::Result<TcpStream>;
+    ...
+}
+#[cfg(unix)]    impl AsRawFd for TcpListener { ... }
+#[cfg(windows)] impl AsRawSocket for TcpListener { ... }
+```
+
+Some major changes from today's API include:
+
+* The static distinction between `TcpAcceptor` and `TcpListener` has been
+  removed (more on this in the [socket][Sockets] section).
+* The `clone` functionality has been removed in favor of `try_clone` (same
+  caveats as `TcpStream`).
+* The `close_accept` functionality is removed entirely. This is not currently
+  implemented via `shutdown` (not supported well across platforms) and is
+  instead implemented via `select`. This functionality can return at a later
+  date with a more robust interface.
+* The `set_timeout` functionality has also been removed in favor of returning at
+  a later date in a more robust fashion with `select`.
+* The `accept` function no longer takes `&mut self` and returns `SocketAddr`.
+  The change in mutability is done to express that multiple `accept` calls can
+  happen concurrently.
+* For convenience the iterator does not yield the `SocketAddr` from `accept`.
+
+The `TcpListener` type will also adhere to `Send` and `Sync`.
+
+#### UDP
+[UDP]: #udp
+
+The UDP infrastructure will receive a similar face-lift as the TCP
+infrastructure will:
+
+```rust
+impl UdpSocket {
+    fn bind<A: ToSocketAddrs>(addr: &A) -> io::Result<UdpSocket>;
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
+    fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: &A) -> io::Result<usize>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn try_clone(&self) -> io::Result<UdpSocket>;
+}
+
+#[cfg(unix)]    impl AsRawFd for UdpSocket { ... }
+#[cfg(windows)] impl AsRawSocket for UdpSocket { ... }
+```
+
+Some important points of note are:
+
+* The `send` and `recv` function take `&self` instead of `&mut self` to indicate
+  that they may be called safely in concurrent contexts.
+* All configuration options such as `multicast` and `ttl` are left as
+  `#[unstable]` for now.
+* All timeout support is removed. This may come back in the form of `setsockopt`
+  (as with TCP streams) or with a more general implementation of `select`.
+* `clone` functionality has been replaced with `try_clone`.
+
+The `UdpSocket` type will adhere to both `Send` and `Sync`.
+
+#### Sockets
+[Sockets]: #sockets
+
+The current constructors for `TcpStream`, `TcpListener`, and `UdpSocket` are
+largely "convenience constructors" as they do not expose the underlying details
+that a socket can be configured before it is bound, connected, or listened on.
+One of the more frequent configuration options is `SO_REUSEADDR` which is set by
+default for `TcpListener` currently.
+
+This RFC leaves it as an open question how best to implement this
+pre-configuration. The constructors today will likely remain no matter what as
+convenience constructors and a new structure would implement consuming methods
+to transform itself to each of the various `TcpStream`, `TcpListener`, and
+`UdpSocket`.
+
+This RFC does, however, recommend not adding multiple constructors to the
+various types to set various configuration options. This pattern is best
+expressed via a flexible socket type to be added at a future date.
+
+#### Addresses
+[Addresses]: #addresses
+
+For the current `addrinfo` module:
+
+* The `get_host_addresses` should be renamed to `lookup_host`.
+* All other contents should be removed.
+
+For the current `ip` module:
+
+* The `ToSocketAddr` trait should become `ToSocketAddrs`
+* The default `to_socket_addr_all` method should be removed.
+
+The following implementations of `ToSocketAddrs` will be available:
+
+```rust
+impl ToSocketAddrs for SocketAddr { ... }
+impl ToSocketAddrs for SocketAddrV4 { ... }
+impl ToSocketAddrs for SocketAddrV6 { ... }
+impl ToSocketAddrs for (Ipv4Addr, u16) { ... }
+impl ToSocketAddrs for (Ipv6Addr, u16) { ... }
+impl ToSocketAddrs for (&str, u16) { ... }
+impl ToSocketAddrs for str { ... }
+impl<T: ToSocketAddrs> ToSocketAddrs for &T { ... }
+```
 
 ### `std::process`
 [std::process]: #stdprocess
